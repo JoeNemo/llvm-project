@@ -28,17 +28,31 @@
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCDirectives.h"
 #include "llvm/MC/MCExpr.h"
+#include "llvm/MC/MCGOFFAttributes.h"
 #include "llvm/MC/MCInstBuilder.h"
 #include "llvm/MC/MCSectionELF.h"
+#include "llvm/MC/MCSectionGOFF.h"
 #include "llvm/MC/MCStreamer.h"
 #include "llvm/MC/MCSymbolGOFF.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Chrono.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ConvertEBCDIC.h"
 #include "llvm/Support/FormatVariadic.h"
 
 using namespace llvm;
+
+// When set, emit a CELQMAIN CSECT describing the AMODE 64 C main routine so a
+// (cross-)compiled object can be bound into a runnable Language Environment
+// executable. Upstream codegen references CELQSTRT and emits PPA1/PPA2 but
+// never defines CELQMAIN; without it LE's bootstrap abends U4093 reason X'218'
+// (CEERSN_64_NOMAIN) at enclave init, before any user code runs. Off by
+// default; opt in with -mllvm -systemz-emit-celqmain.
+static cl::opt<bool> EmitCELQMAIN(
+    "systemz-emit-celqmain",
+    cl::desc("z/OS: emit CELQMAIN CSECT for the AMODE 64 main routine"),
+    cl::init(false), cl::Hidden);
 
 // Return an RI instruction like MI with opcode Opcode, but with the
 // GR64 register operands turned into GR32s.
@@ -1228,6 +1242,10 @@ void SystemZAsmPrinter::emitEndOfAsmFile(Module &M) {
   if (TT.isOSzOS()) {
     emitADASection();
     emitIDRLSection(M);
+    if (EmitCELQMAIN) {
+      emitCELQMAIN(M);
+      emitCELQSTRT(M);
+    }
   }
   emitAttributes(M);
 }
@@ -1297,6 +1315,219 @@ void SystemZAsmPrinter::emitADASection() {
     }
 #undef EMIT_COMMENT
   }
+  OutStreamer->popSection();
+}
+
+// Emit the CELQMAIN CSECT for an AMODE 64 C main routine. Language Environment's
+// bootstrap (entry CELQSTRT -> CELQBST) locates the program's main through the
+// CELQMAIN CSECT; if it is absent, or its main-address slot is zero, LE abends
+// U4093 reason X'218' (CEERSN_64_NOMAIN) during enclave initialization, before
+// any user code runs.
+//
+// Layout per z/OS Language Environment Vendor Interfaces (SA38-0688), "Program
+// initialization and termination for AMODE 64 applications", cross-checked
+// against an ibm-clang -c reference object:
+//
+//   +0x00  word   0x05000001   NORENT marker (0x05) + low byte 0x01 = XPLINK main
+//   +0x04  word   0x00000000   reserved
+//   +0x08  AD(8)               address of main entry point   (reloc -> main)
+//   +0x10  AD(8)               address of CELQINPL           (reloc -> extern)
+//   +0x18  AD(8)               environment, or -1 if none
+//
+// CELQINPL (the C run-time initialization parameter list) is resolved at bind
+// time from the LE/C run-time side decks the driver already includes.
+void SystemZAsmPrinter::emitCELQMAIN(Module &M) {
+  Function *MainFn = M.getFunction("main");
+  if (!MainFn || MainFn->isDeclaration())
+    return;
+
+  MCContext &Ctx = OutContext;
+
+  // Build SD(CELQMAIN) -> ED(C_DATA64) holding a single exported label
+  // CELQMAIN, mirroring the structure ibm-clang produces.
+  MCSectionGOFF *SD = Ctx.getGOFFSection(
+      SectionKind::getMetadata(), "CELQMAIN",
+      GOFF::SDAttr{GOFF::ESD_TA_Unspecified, GOFF::ESD_BSC_Unspecified});
+  MCSectionGOFF *ED = Ctx.getGOFFSection(
+      SectionKind::getData(), GOFF::CLASS_DATA,
+      GOFF::EDAttr{false, GOFF::ESD_RMODE_64, GOFF::ESD_NS_NormalName,
+                   GOFF::ESD_TS_ByteOriented, GOFF::ESD_BA_Concatenate,
+                   GOFF::ESD_LB_Initial, GOFF::ESD_RQ_0,
+                   GOFF::ESD_ALIGN_Doubleword, 0},
+      SD);
+
+  OutStreamer->pushSection();
+  OutStreamer->switchSection(ED);
+
+  // External CELQMAIN definition whose ESD behavioral attributes match what LE
+  // expects, verified byte-for-byte against an ibm-clang object. The binder
+  // checks the XPLINK attribute of every reference vs its target and rejects a
+  // mismatch with IEW2469E REASON 2. Note MCSymbolGOFF defaults to XPLINK
+  // linkage and exported (ImportExport) scope; CELQMAIN must instead be
+  // OS-linkage data with Library scope (setHidden => not exported).
+  auto *Celqmain =
+      static_cast<MCSymbolGOFF *>(Ctx.getOrCreateSymbol("CELQMAIN"));
+  Celqmain->setCodeData(GOFF::ESD_EXE_DATA);
+  Celqmain->setLinkage(GOFF::ESD_LT_OS);
+  Celqmain->setExternal(true);
+  Celqmain->setHidden(true); // Library scope, not ImportExport.
+  OutStreamer->emitLabel(Celqmain);
+
+  // CELQINPL (the C run-time init parameter list) is referenced by the C
+  // run-time as OS-linkage CODE with Library scope; match that exactly or the
+  // binder rejects our reference with IEW2469E REASON 2.
+  auto *Celqinpl =
+      static_cast<MCSymbolGOFF *>(Ctx.getOrCreateSymbol("CELQINPL"));
+  Celqinpl->setCodeData(GOFF::ESD_EXE_CODE);
+  Celqinpl->setLinkage(GOFF::ESD_LT_OS);
+  Celqinpl->setHidden(true); // Library scope, not ImportExport.
+
+  const unsigned PtrSize = getDataLayout().getPointerSize(); // 8 on AMODE 64
+
+  // clang emits reentrant code (a C_WSA64 writable static area), so CELQMAIN
+  // must use the RENT marker (0x04000001); the NORENT marker (0x05000001) is
+  // for non-reentrant mains. The two forms share identical bytes for the
+  // "no environment" case below (+0x18/+0x1C = -1), so only the marker differs.
+  OutStreamer->AddComment("CELQMAIN: RENT marker + XPLINK main");
+  OutStreamer->emitInt32(0x04000001);
+  OutStreamer->emitInt32(0x00000000); // reserved
+
+  // Reference main through an external reference (ER), not its label (LD)
+  // directly -- matching ibm-clang. A cross-CSECT address constant pointing at
+  // a label definition in another element is not reliably relocated by the
+  // binder; it would leave this slot zero at run time, so LE's bootstrap reads
+  // a zero main address and abends U4093 X'218' even though CELQMAIN is bound
+  // in. Routing through an ER named "main" lets the binder resolve it by name
+  // to the main definition. main is XPLINK code with Library scope (the default
+  // MCSymbolGOFF linkage is XPLINK, which is correct here).
+  auto *MainRef =
+      static_cast<MCSymbolGOFF *>(Ctx.getOrCreateSymbol("__celqmain_main_ref"));
+  MainRef->setExternalName("main");
+  MainRef->setCodeData(GOFF::ESD_EXE_CODE);
+  MainRef->setHidden(true); // Library scope, matches IBM's main ER.
+  OutStreamer->AddComment("A(main entry point)");
+  OutStreamer->emitValue(MCSymbolRefExpr::create(MainRef, Ctx), PtrSize);
+
+  OutStreamer->AddComment("A(CELQINPL)");
+  OutStreamer->emitValue(MCSymbolRefExpr::create(Celqinpl, Ctx), PtrSize);
+
+  OutStreamer->AddComment("environment (-1 = none)");
+  OutStreamer->emitInt64(static_cast<uint64_t>(-1));
+
+  OutStreamer->popSection();
+}
+
+// Emit the CELQSTRT bootstrap CSECT for an AMODE 64 C main, reproducing the
+// CSECT ibm-clang generates (z/OS LE Vendor Interfaces, "Program initialization
+// and termination for AMODE 64 applications", CELQSTRT Sections 1-5). CELQSTRT
+// is the LE entry point: a small position-independent stub that calls the LE
+// bootstrap CELQBST, plus a parameter list (PLIST) pointing at CELQMAIN (and
+// CELQFMAN/CELQLLST/CELQETBL) *within this object*. Emitting it here keeps the
+// CELQSTRT->CELQMAIN link intra-module -- the LE-supplied default CELQSTRT does
+// not resolve an application-provided CELQMAIN, so a main built without this
+// abends U4093 X'218'. The 0x98-byte image and relocations are reproduced from
+// an ibm-clang reference object.
+void SystemZAsmPrinter::emitCELQSTRT(Module &M) {
+  Function *MainFn = M.getFunction("main");
+  if (!MainFn || MainFn->isDeclaration())
+    return;
+
+  MCContext &Ctx = OutContext;
+
+  // SD(CELQSTRT) -> ED(C_CODE64) -> LD CELQSTRT (the entry point).
+  MCSectionGOFF *SD = Ctx.getGOFFSection(
+      SectionKind::getMetadata(), "CELQSTRT",
+      GOFF::SDAttr{GOFF::ESD_TA_Unspecified, GOFF::ESD_BSC_Unspecified});
+  MCSectionGOFF *ED = Ctx.getGOFFSection(
+      SectionKind::getText(), GOFF::CLASS_CODE,
+      GOFF::EDAttr{/*IsReadOnly=*/true, GOFF::ESD_RMODE_64,
+                   GOFF::ESD_NS_NormalName, GOFF::ESD_TS_ByteOriented,
+                   GOFF::ESD_BA_Concatenate, GOFF::ESD_LB_Initial, GOFF::ESD_RQ_0,
+                   GOFF::ESD_ALIGN_Doubleword, 0},
+      SD);
+
+  OutStreamer->pushSection();
+  OutStreamer->switchSection(ED);
+
+  // CELQSTRT label = the entry point: external OS-linkage code, Library scope
+  // (matches ibm-clang's LD). clang's emitPPA2 already references this symbol;
+  // defining it here makes that reference intra-object.
+  auto *Celqstrt =
+      static_cast<MCSymbolGOFF *>(Ctx.getOrCreateSymbol("CELQSTRT"));
+  Celqstrt->setCodeData(GOFF::ESD_EXE_CODE);
+  Celqstrt->setLinkage(GOFF::ESD_LT_OS);
+  Celqstrt->setExternal(true);
+  Celqstrt->setHidden(true); // Library scope.
+  OutStreamer->emitLabel(Celqstrt);
+
+  // External reference with the attributes LE expects (OS linkage, Library
+  // scope). Internal != External name lets us reference a symbol (CELQMAIN) that
+  // is also defined in this object, forcing an ER the binder resolves by name.
+  auto makeRef = [&](StringRef Internal, StringRef External,
+                     GOFF::ESDExecutable Exec, bool Weak) -> const MCExpr * {
+    auto *S = static_cast<MCSymbolGOFF *>(Ctx.getOrCreateSymbol(Internal));
+    if (!External.empty())
+      S->setExternalName(External);
+    S->setCodeData(Exec);
+    S->setLinkage(GOFF::ESD_LT_OS);
+    S->setHidden(true); // Library scope.
+    if (Weak)
+      S->setWeak(true);
+    return MCSymbolRefExpr::create(S, Ctx);
+  };
+
+  const MCExpr *CelqstrtBase = MCSymbolRefExpr::create(Celqstrt, Ctx);
+  auto selfPlus = [&](uint64_t Off) -> const MCExpr * {
+    return MCBinaryExpr::createAdd(
+        CelqstrtBase, MCConstantExpr::create(Off, Ctx), Ctx);
+  };
+
+  // CELQMAIN/CELQFMAN are weak (CELQFMAN has no fetchable subroutine -> 0);
+  // CELQLLST/CELQETBL/CELQBST are strong, autocalled from LE. CELQBST is code.
+  const MCExpr *CelqmainRef =
+      makeRef("__celqstrt_celqmain", "CELQMAIN", GOFF::ESD_EXE_DATA, true);
+  const MCExpr *CelqfmanRef = makeRef("CELQFMAN", "", GOFF::ESD_EXE_DATA, true);
+  const MCExpr *CelqllstRef = makeRef("CELQLLST", "", GOFF::ESD_EXE_DATA, false);
+  const MCExpr *CelqetblRef = makeRef("CELQETBL", "", GOFF::ESD_EXE_DATA, false);
+  const MCExpr *CelqbstRef = makeRef("CELQBST", "", GOFF::ESD_EXE_CODE, false);
+
+  // 0x98-byte CELQSTRT image, verbatim from the ibm-clang reference object.
+  // +0x00..0x17: entry code + signature.
+  static const uint8_t Code0[] = {
+      0x47, 0x00, 0x00, 0x00, 0x47, 0x00, 0x00, 0x02, // NOP 0; NOP 2
+      0xEB, 0xEC, 0xD0, 0x08, 0x00, 0x24,             // STMG 14,12,8(13)
+      0xA7, 0xF4, 0x00, 0x0E,                         // BRU AROUND
+      0x00, 0x18,                                     // AL2 signature length
+      0xCE, 0x03, 0x03, 0x0F};                        // CEL signature
+  OutStreamer->emitBytes(StringRef((const char *)Code0, sizeof(Code0)));
+  OutStreamer->emitValue(selfPlus(0x38), 8); // +0x18 AD(PLIST)
+  // +0x20..0x37: eyecatcher + flags + AROUND code (calls CELQBST).
+  static const uint8_t Code1[] = {
+      0xC3, 0xC5, 0xC5, 0xE2, 0xE3, 0xC1, 0xD9, 0xE3, // "CEESTART"
+      0x01, 0x00,                                     // XPLINK main; reserved
+      0x05, 0x30,                                     // BALR 3,0
+      0xE3, 0xF0, 0x30, 0x64, 0x00, 0x04,             // LG 15,BSTRAP(,3)
+      0x05, 0x0F,                                     // BALR 0,15
+      0x00, 0x00, 0x00, 0x00};                        // pad
+  OutStreamer->emitBytes(StringRef((const char *)Code1, sizeof(Code1)));
+  OutStreamer->emitValue(CelqmainRef, 8); // +0x38 AD(CELQMAIN)
+  // +0x40..0x5F: version marker, CEESTLEN, pad, 3x reserved AD(0).
+  static const uint8_t Plist0[] = {
+      0xFF, 0xFD,                                     // H'-3' version marker
+      0x00, 0x58,                                     // AL2 CEESTLEN
+      0x00, 0x00, 0x00, 0x00,                         // pad
+      0, 0, 0, 0, 0, 0, 0, 0,                         // AD(0)
+      0, 0, 0, 0, 0, 0, 0, 0,                         // AD(0)
+      0, 0, 0, 0, 0, 0, 0, 0};                        // AD(0)
+  OutStreamer->emitBytes(StringRef((const char *)Plist0, sizeof(Plist0)));
+  OutStreamer->emitValue(selfPlus(0x12), 8); // +0x60 AD(SIGNATUR)
+  OutStreamer->emitInt64(0);                  // +0x68 reserved AD(0)
+  OutStreamer->emitValue(CelqfmanRef, 8);     // +0x70 AD(CELQFMAN)
+  OutStreamer->emitValue(CelqllstRef, 8);     // +0x78 AD(CELQLLST)
+  OutStreamer->emitInt64(0);                  // +0x80 reserved AD(0)
+  OutStreamer->emitValue(CelqetblRef, 8);     // +0x88 AD(CELQETBL)
+  OutStreamer->emitValue(CelqbstRef, 8);      // +0x90 AD(CELQBST) = BSTRAP
+
   OutStreamer->popSection();
 }
 

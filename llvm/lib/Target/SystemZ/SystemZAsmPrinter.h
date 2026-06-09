@@ -103,6 +103,8 @@ private:
   void emitPPA2(Module &M);
   void emitADASection();
   void emitIDRLSection(Module &M);
+  void emitCELQMAIN(Module &M);
+  void emitCELQSTRT(Module &M);
 
 public:
   SystemZAsmPrinter(TargetMachine &TM, std::unique_ptr<MCStreamer> Streamer)
