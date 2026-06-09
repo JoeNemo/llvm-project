@@ -17,6 +17,7 @@
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCGOFFStreamer.h"
 #include "llvm/MC/MCObjectFileInfo.h"
+#include "llvm/Support/Alignment.h"
 
 using namespace llvm;
 
@@ -28,6 +29,10 @@ void SystemZTargetStreamer::emitConstantPools() {
   const MCObjectFileInfo &OFI = *Streamer.getContext().getObjectFileInfo();
   Streamer.switchSection(OFI.getTextSection());
   for (auto &I : EXRLTargets2Sym) {
+    // EXRL targets must be halfword-aligned since EXRL uses a PC-relative
+    // offset that is scaled by 2. Emit alignment to ensure correctness
+    // when the target follows odd-sized data (e.g., string constants).
+    Streamer.emitCodeAlignment(Align(2), nullptr, 0);
     Streamer.emitLabel(I.second);
     const MCInstSTIPair &MCI_STI = I.first;
     Streamer.emitInstruction(MCI_STI.first, *MCI_STI.second);
