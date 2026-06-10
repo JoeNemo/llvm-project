@@ -1473,6 +1473,8 @@ bool Parser::isValidAfterTypeSpecifier(bool CouldBeBitfield) {
   case tok::annot_pragma_ms_pointers_to_members:
   // struct foo {...} _Pragma(export(...));
   case tok::annot_pragma_export:
+  // struct foo {...} _Pragma(map(...));
+  case tok::annot_pragma_map:
     return true;
   case tok::colon:
     return CouldBeBitfield || // enum E { ... }   :         2;
@@ -3401,6 +3403,9 @@ Parser::DeclGroupPtrTy Parser::ParseCXXClassMemberDeclarationWithPragmas(
     return nullptr;
   case tok::annot_pragma_export:
     HandlePragmaExport();
+    return nullptr;
+  case tok::annot_pragma_map:
+    HandlePragmaMap();
     return nullptr;
   case tok::annot_pragma_dump:
     HandlePragmaDump();

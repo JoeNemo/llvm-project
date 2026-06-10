@@ -2361,6 +2361,12 @@ public:
   void ActOnPragmaExport(IdentifierInfo *IdentId, SourceLocation ExportNameLoc,
                          Scope *curScope);
 
+  /// ActOnPragmaMap - called on well-formed '\#pragma map(ident, "extname")'.
+  /// Gives the named function or variable the exact external (binder) name
+  /// ExternalName, like an asm label.
+  void ActOnPragmaMap(IdentifierInfo *IdentId, StringRef ExternalName,
+                      SourceLocation IdentLoc, SourceLocation ExtNameLoc);
+
   /// Only called on function definitions; if there is a pragma in scope
   /// with the effect of a range-based optnone, consider marking the function
   /// with attribute optnone.

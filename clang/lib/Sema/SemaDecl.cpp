@@ -21156,6 +21156,29 @@ void Sema::ActOnPragmaRedefineExtname(IdentifierInfo* Name,
     (void)ExtnameUndeclaredIdentifiers.insert(std::make_pair(Name, Attr));
 }
 
+void Sema::ActOnPragmaMap(IdentifierInfo *Name, StringRef ExternalName,
+                          SourceLocation IdentLoc,
+                          SourceLocation ExtNameLoc) {
+  NamedDecl *PrevDecl =
+      LookupSingleName(TUScope, Name, IdentLoc, LookupOrdinaryName);
+  AttributeCommonInfo Info(Name, SourceRange(ExtNameLoc),
+                           AttributeCommonInfo::Form::Pragma());
+  AsmLabelAttr *Attr =
+      AsmLabelAttr::CreateImplicit(Context, ExternalName, Info);
+
+  // Mirror #pragma redefine_extname: if a function or variable with external
+  // linkage is already declared, attach the label to it; otherwise remember
+  // the mapping and apply it when the name is declared.
+  if (PrevDecl && (isa<FunctionDecl>(PrevDecl) || isa<VarDecl>(PrevDecl))) {
+    if (isDeclExternC(PrevDecl))
+      PrevDecl->addAttr(Attr);
+    else
+      Diag(PrevDecl->getLocation(), diag::warn_redefine_extname_not_applied)
+          << /*Variable*/ (isa<FunctionDecl>(PrevDecl) ? 0 : 1) << PrevDecl;
+  } else
+    (void)ExtnameUndeclaredIdentifiers.insert(std::make_pair(Name, Attr));
+}
+
 void Sema::ActOnPragmaWeakID(IdentifierInfo* Name,
                              SourceLocation PragmaLoc,
                              SourceLocation NameLoc) {
