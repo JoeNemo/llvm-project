@@ -1325,14 +1325,32 @@ void SystemZAsmPrinter::emitADASection() {
 // any user code runs.
 //
 // Layout per z/OS Language Environment Vendor Interfaces (SA38-0688), "Program
-// initialization and termination for AMODE 64 applications", cross-checked
-// against an ibm-clang -c reference object:
+// initialization and termination for AMODE 64 applications", RENT form (clang
+// on z/OS always compiles for constructed reentrancy -- writable statics and
+// XPLINK function descriptors live in the C_WSA64 ADA part):
 //
-//   +0x00  word   0x05000001   NORENT marker (0x05) + low byte 0x01 = XPLINK main
+//   +0x00  word   0x04000001   RENT marker (0x04) + low byte 0x01 = XPLINK main
 //   +0x04  word   0x00000000   reserved
 //   +0x08  AD(8)               address of main entry point   (reloc -> main)
 //   +0x10  AD(8)               address of CELQINPL           (reloc -> extern)
-//   +0x18  AD(8)               environment, or -1 if none
+//   +0x18  AD(8)               environment: R-con, ADA associated with main
+//
+// LE's bootstrap builds main's XPLINK function descriptor from this CSECT:
+// entry point from +0x08, environment R5 from +0x18. A main whose code
+// references writable static (statics, or calls through XPLINK function
+// descriptors, which live in the WSA) addresses it via R5; with no
+// environment it loads null descriptors and program-checks.
+//
+// The environment field is emitted exactly as ibm-clang emits it: a single
+// 8-byte R-con on main (the relocation XPLINK descriptor environment slots
+// use), which the binder associates with main's C_WSA64 part and the loader
+// finishes when LE instantiates the WSA -- so LE reads a complete pointer.
+// LE equally accepts the form documented in the Vendor Interfaces book for
+// RENT, A(0) word + Q(environment) word (proven on-box before switching),
+// and -1/-1 meaning "no environment", valid only for a naturally-reentrant
+// main that never references its WSA. (The NORENT form, marker 0x05000001,
+// has a direct AD(environment)-or-0 at +0x18, for statics in a load-time
+// class -- not clang's model.)
 //
 // CELQINPL (the C run-time initialization parameter list) is resolved at bind
 // time from the LE/C run-time side decks the driver already includes.
@@ -1386,8 +1404,8 @@ void SystemZAsmPrinter::emitCELQMAIN(Module &M) {
 
   // clang emits reentrant code (a C_WSA64 writable static area), so CELQMAIN
   // must use the RENT marker (0x04000001); the NORENT marker (0x05000001) is
-  // for non-reentrant mains. The two forms share identical bytes for the
-  // "no environment" case below (+0x18/+0x1C = -1), so only the marker differs.
+  // for non-reentrant mains, whose environment (statics in a load-time class)
+  // is bind-time resolvable rather than an R-con against the deferred WSA.
   OutStreamer->AddComment("CELQMAIN: RENT marker + XPLINK main");
   OutStreamer->emitInt32(0x04000001);
   OutStreamer->emitInt32(0x00000000); // reserved
@@ -1411,8 +1429,20 @@ void SystemZAsmPrinter::emitCELQMAIN(Module &M) {
   OutStreamer->AddComment("A(CELQINPL)");
   OutStreamer->emitValue(MCSymbolRefExpr::create(Celqinpl, Ctx), PtrSize);
 
-  OutStreamer->AddComment("environment (-1 = none)");
-  OutStreamer->emitInt64(static_cast<uint64_t>(-1));
+  // Environment: one 8-byte R-con on main -- "address of the ADA associated
+  // with main" -- the same relocation the XPLINK function descriptor
+  // environment slots use (emitADASection). The binder ties main to its
+  // CU's C_WSA64 part; the fixup completes when LE instantiates the WSA at
+  // enclave initialization, so LE reads a finished environment pointer here
+  // and passes it to main in R5. Emitted unconditionally: clang always
+  // compiles for constructed reentrancy, and a main that never touches its
+  // WSA simply ignores R5. Without an environment, a main that calls other
+  // functions through its WSA descriptors loads nulls and program-checks.
+  OutStreamer->AddComment("AD(environment): R-con, ADA associated with main");
+  OutStreamer->emitValue(
+      MCSpecifierExpr::create(MCSymbolRefExpr::create(MainRef, Ctx),
+                              SystemZ::S_RCon, Ctx),
+      PtrSize);
 
   OutStreamer->popSection();
 }
