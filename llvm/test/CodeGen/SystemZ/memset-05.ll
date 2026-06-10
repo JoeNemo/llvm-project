@@ -239,10 +239,13 @@ define void @fun8() {
   ret void
 }
 
-; CHECK:       .Ltmp2:
-; CHECK-NEXT: 	 xc 0(1,%r1), 0(%r1)
+; CHECK:       .p2align 1
+; CHECK-NEXT:  .Ltmp2:
+; CHECK-NEXT:    xc 0(1,%r1), 0(%r1)
+; CHECK-NEXT:    .p2align 1
 ; CHECK-NEXT:  .Ltmp0:
 ; CHECK-NEXT:    xc 0(1,%r2), 0(%r2)
+; CHECK-NEXT:    .p2align 1
 ; CHECK-NEXT:  .Ltmp1:
 ; CHECK-NEXT:    xc 0(1,%r3), 0(%r3)
 

@@ -17,8 +17,10 @@
 # CHECK-NEXT:  tmll
 # CHECK-NEXT:  jne
 
-# CHECK:       .Ltmp1:
+# CHECK:       .p2align 1
+# CHECK-NEXT:  .Ltmp1:
 # CHECK-NEXT:  xc      0(1,%r3), 0(%r2)
+# CHECK-NEXT:  .p2align 1
 # CHECK-NEXT:  .Ltmp0:
 # CHECK-NEXT:  xc      0(1,%r14), 0(%r14)
 ---
